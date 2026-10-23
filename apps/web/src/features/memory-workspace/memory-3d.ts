@@ -298,6 +298,50 @@ export function selectMemoryLabels(
   return placements;
 }
 
+export const MEMORY_LABEL_CANDIDATE_CAP = 512;
+
+/**
+ * Collect one frame's label candidates from the scene's nodes in projected
+ * order, without allocating for nodes that cannot be labeled. The zoom gate
+ * from selectMemoryLabels is applied before a candidate object exists, and
+ * the survivors are grouped in selection priority (focus, core, sources,
+ * rest) and capped. selectMemoryLabels measures at most
+ * MEMORY_LABEL_MAX_MEASURED_PER_FRAME candidates before it stops, so a
+ * working set of 512 in priority order cannot change which labels are
+ * placed — but the per-frame cost stays bounded at any graph size instead
+ * of an allocation and a sort over every node.
+ */
+export function collectMemoryLabelCandidates(
+  nodes: MemoryGraphNode[],
+  projected: Float32Array,
+  options: { focusId?: string | null; zoom: number }
+): MemoryLabelCandidate[] {
+  const focusId = options.focusId ?? null;
+  const focus: MemoryLabelCandidate[] = [];
+  const core: MemoryLabelCandidate[] = [];
+  const sources: MemoryLabelCandidate[] = [];
+  const rest: MemoryLabelCandidate[] = [];
+  const count = Math.min(nodes.length, Math.floor(projected.length / 4));
+  for (let index = 0; index < count; index++) {
+    const node = nodes[index]!;
+    const isFocus = node.id === focusId;
+    if (!isFocus && node.type !== "SOURCE" && options.zoom < 1.6) continue;
+    const candidate: MemoryLabelCandidate = {
+      id: node.id,
+      label: node.label,
+      type: node.type,
+      core: isMemoryCoreLabel(node.label),
+      x: projected[index * 4]!,
+      y: projected[index * 4 + 1]!
+    };
+    if (isFocus) focus.push(candidate);
+    else if (candidate.core) core.push(candidate);
+    else if (node.type === "SOURCE") sources.push(candidate);
+    else rest.push(candidate);
+  }
+  return [...focus, ...core, ...sources, ...rest].slice(0, MEMORY_LABEL_CANDIDATE_CAP);
+}
+
 /** Normalized covariance determinant: 0 for a plane, 1 for equal spread in XYZ. */
 export function memory3DVolumeRatio(points: MemoryPoint3D[]): number {
   if (points.length < 4) return 0;

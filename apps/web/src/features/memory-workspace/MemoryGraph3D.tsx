@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef } from "react";
 import type { MemoryGraphNode, MemoryGraphEdge } from "@space/contracts";
 import type { MemoryAtlasPosition } from "./memory-atlas.js";
 import { isMemoryCoreLabel } from "./memory-graph-visuals.js";
-import { DEFAULT_MEMORY_CAMERA, memory3DVolumeRatio, projectMemoryPoint, selectMemoryLabels, type MemoryCamera3D, type MemoryPoint3D } from "./memory-3d.js";
+import { DEFAULT_MEMORY_CAMERA, collectMemoryLabelCandidates, memory3DVolumeRatio, projectMemoryPoint, selectMemoryLabels, type MemoryCamera3D, type MemoryPoint3D } from "./memory-3d.js";
 import { MemoryGraphWebGLRenderer, hexToRgb, type MemoryWebGLScene } from "./memory-graph-webgl.js";
 
 /** The Canvas 2D fallback keeps the historical cap from the overview endpoint. */
@@ -11,6 +11,8 @@ const CANVAS_2D_NODE_CAP = 2000;
 interface SceneData {
   scene: MemoryWebGLScene;
   ids: string[];
+  /** Node objects aligned with `ids` (and with the projected points). */
+  orderedNodes: MemoryGraphNode[];
   indexById: Map<string, number>;
   neighborsByIndex: Array<Set<number>>;
 }
@@ -65,6 +67,7 @@ function buildScene(nodes: MemoryGraphNode[], edges: MemoryGraphEdge[], coordina
   return {
     scene: { positions: scenePositions, colors, baseSizes, edgePositions, edgeColors, edgeNodeIndices, extent },
     ids,
+    orderedNodes: ids.map(id => nodeById.get(id)!),
     indexById,
     neighborsByIndex
   };
@@ -130,8 +133,8 @@ export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles
       const sameShape = sceneData && next.ids.length === sceneData.ids.length && next.ids.every((id, index) => id === sceneData!.ids[index]);
       if (sameShape && nodes === sceneNodes && edges === sceneEdges && positions === scenePositions) {
         // Layout streaming: only the coordinates moved, so push the new
-        // position array into the existing GPU buffers instead of a rebuild.
-        renderer.updatePositions(next.scene.positions);
+        // position arrays into the existing GPU buffers instead of a rebuild.
+        renderer.updatePositions(next.scene.positions, next.scene.edgePositions);
         sceneData = next;
       } else {
         renderer.setScene(next.scene);
@@ -156,22 +159,13 @@ export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles
     const drawLabels = (projected: Float32Array) => {
       if (!labelContext) labelContext = labelCanvas.getContext("2d");
       if (!labelContext) return;
-      const { nodes, showTitles } = current.current;
+      const { showTitles } = current.current;
       labelContext.setTransform(dpr, 0, 0, dpr, 0, 0);
       labelContext.clearRect(0, 0, width, height);
       if (!showTitles || !sceneData) return;
-      const nodeById = new Map(nodes.map(node => [node.id, node]));
-      const candidates = sceneData.ids.flatMap((id, index) => {
-        const node = nodeById.get(id);
-        if (!node) return [];
-        return [{
-          id,
-          label: node.label,
-          type: node.type,
-          core: isMemoryCoreLabel(node.label),
-          x: projected[index * 4]!,
-          y: projected[index * 4 + 1]!
-        }];
+      const candidates = collectMemoryLabelCandidates(sceneData.orderedNodes, projected, {
+        focusId: hover ?? current.current.selectedNodeId,
+        zoom: cameraRef.current.zoom
       });
       labelContext.font = "11px system-ui, sans-serif";
       const placements = selectMemoryLabels(candidates, {
@@ -201,6 +195,10 @@ export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles
     const renderCanvas2D = () => {
       const context = fallbackContext();
       if (!context) return;
+      // A resize resets the context transform, and after a WebGL context
+      // loss nothing reapplies it to the fallback context — set it on every
+      // draw so the fallback renders at CSS-pixel scale on any display.
+      context.setTransform(dpr, 0, 0, dpr, 0, 0);
       const all = current.current;
       const cappedNodes = all.nodes.length > CANVAS_2D_NODE_CAP ? all.nodes.slice(0, CANVAS_2D_NODE_CAP) : all.nodes;
       const cappedIds = new Set(cappedNodes.map(node => node.id));

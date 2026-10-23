@@ -169,6 +169,7 @@ export class MemoryGraphWebGLRenderer {
   private edgeVertexCount = 0;
   private dimBuffer: WebGLBuffer | null = null;
   private highlightBuffer: WebGLBuffer | null = null;
+  private edgePositionBuffer: WebGLBuffer | null = null;
   private pickIndex = new MemoryPickIndex();
   private projected: Float32Array = new Float32Array(0);
   private radii: Float32Array = new Float32Array(0);
@@ -236,14 +237,15 @@ export class MemoryGraphWebGLRenderer {
     return buffer;
   }
 
-  private bindVertex(program: WebGLProgram, vao: WebGLVertexArrayObject, name: string, data: Float32Array, size: number): void {
+  private bindVertex(program: WebGLProgram, vao: WebGLVertexArrayObject, name: string, data: Float32Array, size: number, usage: number = this.gl.STATIC_DRAW): WebGLBuffer {
     const gl = this.gl;
     gl.bindVertexArray(vao);
-    const buffer = this.createBuffer(data, gl.STATIC_DRAW);
+    const buffer = this.createBuffer(data, usage);
     const location = gl.getAttribLocation(program, name);
     gl.enableVertexAttribArray(location);
     gl.vertexAttribPointer(location, size, gl.FLOAT, false, 0, 0);
     gl.bindVertexArray(null);
+    return buffer;
   }
 
   setScene(scene: MemoryWebGLScene): void {
@@ -266,16 +268,16 @@ export class MemoryGraphWebGLRenderer {
     gl.vertexAttribPointer(cornerLocation, 2, gl.FLOAT, false, 0, 0);
     gl.vertexAttribDivisor(cornerLocation, 0);
     gl.bindVertexArray(null);
-    this.bindVertex(this.edgeProgram, this.edgeVao, "aPos", scene.edgePositions, 3);
+    this.edgePositionBuffer = this.bindVertex(this.edgeProgram, this.edgeVao, "aPos", scene.edgePositions, 3, gl.DYNAMIC_DRAW);
     this.bindVertex(this.edgeProgram, this.edgeVao, "aColor", scene.edgeColors, 3);
     this.bindVertex(this.edgeProgram, this.edgeVao, "aNodeIndex", scene.edgeNodeIndices, 1);
     this.radii = new Float32Array(this.nodeCount);
   }
 
-  /** Update node positions in place while the layout streams in. */
-  updatePositions(positions: Float32Array): void {
+  /** Update node and edge positions in place while the layout streams in. */
+  updatePositions(positions: Float32Array, edgePositions: Float32Array): void {
     if (!this.scene) return;
-    this.scene = { ...this.scene, positions };
+    this.scene = { ...this.scene, positions, edgePositions };
     const gl = this.gl;
     gl.bindVertexArray(this.nodeVao);
     // The aPos buffer is the first dynamic buffer created for the scene.
@@ -285,6 +287,13 @@ export class MemoryGraphWebGLRenderer {
       gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW);
     }
     gl.bindVertexArray(null);
+    // Edges follow the same snapshots: without this upload they would stay
+    // at the layout captured by setScene while the nodes move on.
+    if (this.edgePositionBuffer) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.edgePositionBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, edgePositions, gl.DYNAMIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    }
   }
 
   /** Focus a node index (or -1 for none); neighbors stay lit, the rest dim. */
