@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef } from "react";
 import type { MemoryGraphNode, MemoryGraphEdge } from "@space/contracts";
 import type { MemoryAtlasPosition } from "./memory-atlas.js";
 import { isMemoryCoreLabel } from "./memory-graph-visuals.js";
-import { DEFAULT_MEMORY_CAMERA, collectMemoryLabelCandidates, memory3DVolumeRatio, projectMemoryPoint, selectMemoryLabels, type MemoryCamera3D, type MemoryPoint3D } from "./memory-3d.js";
+import { DEFAULT_MEMORY_CAMERA, buildStreamedMemoryPositions, collectMemoryLabelCandidates, memory3DVolumeRatio, projectMemoryPoint, selectMemoryLabels, type MemoryCamera3D, type MemoryPoint3D } from "./memory-3d.js";
 import { MemoryGraphWebGLRenderer, hexToRgb, type MemoryWebGLScene } from "./memory-graph-webgl.js";
 
 /** The Canvas 2D fallback keeps the historical cap from the overview endpoint. */
@@ -17,6 +17,15 @@ interface SceneData {
   neighborsByIndex: Array<Set<number>>;
 }
 
+/**
+ * Pack nodes, edges, and their positions into the flat typed-array scene the
+ * WebGL renderer consumes. Returns null until layout coordinates exist.
+ * @param nodes All graph nodes.
+ * @param edges All graph edges.
+ * @param coordinates 3D layout coordinates keyed by node id.
+ * @param positions 2D atlas positions keyed by node id (source of colors/sizes).
+ * @returns The packed scene, or null when no coordinates are ready.
+ */
 function buildScene(nodes: MemoryGraphNode[], edges: MemoryGraphEdge[], coordinates: Map<string, MemoryPoint3D>, positions: Map<string, MemoryAtlasPosition>): SceneData | null {
   const ids: string[] = [];
   const indexById = new Map<string, number>();
@@ -73,6 +82,10 @@ function buildScene(nodes: MemoryGraphNode[], edges: MemoryGraphEdge[], coordina
   };
 }
 
+/**
+ * Interactive 3D memory graph: WebGL2 instanced rendering with a Canvas 2D
+ * fallback, rotation/zoom/pan, hover and click picking, and node labels.
+ */
 export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles, selectedNodeId, onSelectNode, loading, resetToken }: {
   nodes: MemoryGraphNode[]; edges: MemoryGraphEdge[];
   positions: Map<string, MemoryAtlasPosition>; coordinates: Map<string, MemoryPoint3D>;
@@ -115,38 +128,59 @@ export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles
         renderer = null;
       }
     }
+    /** 2D context for drawing; when WebGL is active labels go on the overlay, otherwise the canvas itself. */
     const fallbackContext = (): CanvasRenderingContext2D | null => {
       if (renderer) return labelCanvas.getContext("2d");
       return canvas.getContext("2d") ?? labelCanvas.getContext("2d");
     };
     let labelContext: CanvasRenderingContext2D | null = null;
 
+    /** Rebuild or stream-update the GPU scene when nodes, edges, or coordinates change. */
     const syncScene = () => {
       if (!renderer) return;
       const { nodes, edges, positions, coordinates } = current.current;
       if (sceneData && nodes === sceneNodes && edges === sceneEdges && positions === scenePositions && coordinates === sceneCoordinates) return;
+      if (sceneData && nodes === sceneNodes && edges === sceneEdges && positions === scenePositions) {
+        // Layout streaming: only the coordinates moved. Repacking the full
+        // scene per snapshot (colors, sizes, neighbor sets, edge colors)
+        // costs ~200 ms at 50,000 nodes on the main thread, so rebuild only
+        // the position arrays and push them into the existing GPU buffers.
+        const streamed = buildStreamedMemoryPositions(sceneData.ids, sceneData.scene.edgeNodeIndices, coordinates);
+        if (streamed) {
+          renderer.updatePositions(streamed.positions, streamed.edgePositions, streamed.extent);
+          sceneData = { ...sceneData, scene: { ...sceneData.scene, positions: streamed.positions, edgePositions: streamed.edgePositions, extent: streamed.extent } };
+          sceneCoordinates = coordinates;
+          return;
+        }
+      }
       const next = buildScene(nodes, edges, coordinates, positions);
       if (!next) {
-        sceneData = null;
+        if (sceneData) {
+          // The scene became empty (e.g. an empty search): clear the WebGL
+          // canvas and the picking/focus state. The fallback path draws on
+          // the label canvas only, so without this the last WebGL frame
+          // would stay visible underneath it indefinitely.
+          renderer.clear();
+          sceneData = null;
+          focusIndex = -2;
+          hover = null;
+          points = [];
+        }
         return;
       }
-      const sameShape = sceneData && next.ids.length === sceneData.ids.length && next.ids.every((id, index) => id === sceneData!.ids[index]);
-      if (sameShape && nodes === sceneNodes && edges === sceneEdges && positions === scenePositions) {
-        // Layout streaming: only the coordinates moved, so push the new
-        // position arrays into the existing GPU buffers instead of a rebuild.
-        renderer.updatePositions(next.scene.positions, next.scene.edgePositions);
-        sceneData = next;
-      } else {
-        renderer.setScene(next.scene);
-        sceneData = next;
-        focusIndex = -2;
-      }
+      // Anything reaching here changed more than the coordinates (the pure
+      // streaming case is handled above), so derived arrays such as colors
+      // and neighbor sets may differ — upload the full scene.
+      renderer.setScene(next.scene);
+      sceneData = next;
+      focusIndex = -2;
       sceneNodes = nodes;
       sceneEdges = edges;
       scenePositions = positions;
       sceneCoordinates = coordinates;
     };
 
+    /** Dim non-neighbors and highlight the hovered/selected node. */
     const applyFocus = () => {
       if (!renderer || !sceneData) return;
       const focusId = hover ?? current.current.selectedNodeId;
@@ -156,6 +190,10 @@ export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles
       renderer.setFocus(index, index >= 0 ? sceneData.neighborsByIndex[index]! : null);
     };
 
+    /**
+     * Draw node labels on the overlay from the last projected frame.
+     * @param projected [x, y, depth, perspective] quads from the renderer.
+     */
     const drawLabels = (projected: Float32Array) => {
       if (!labelContext) labelContext = labelCanvas.getContext("2d");
       if (!labelContext) return;
@@ -183,6 +221,7 @@ export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles
       }
     };
 
+    /** One WebGL frame: focus, GPU draw, labels, and rotation state for tests. */
     const renderWebGL = () => {
       if (!renderer || !sceneData) return;
       const scale = Math.min(width, height) * 0.4 / sceneData.scene.extent;
@@ -192,6 +231,7 @@ export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles
       canvas.dataset.rotation = `${cameraRef.current.yaw.toFixed(3)},${cameraRef.current.pitch.toFixed(3)}`;
     };
 
+    /** One Canvas 2D frame (fallback for no-WebGL / lost context), capped at CANVAS_2D_NODE_CAP nodes. */
     const renderCanvas2D = () => {
       const context = fallbackContext();
       if (!context) return;
@@ -206,7 +246,14 @@ export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles
       const edges = all.nodes.length > CANVAS_2D_NODE_CAP ? all.edges.filter(edge => cappedIds.has(edge.source) && cappedIds.has(edge.target)) : all.edges;
       const { positions, coordinates, showTitles, selectedNodeId } = all;
       context.clearRect(0, 0, width, height);
-      const extent = Math.max(60, ...[...coordinates.values()].map(p => Math.hypot(p.x, p.y, p.z)));
+      // Extent over the drawn (capped) nodes only: spreading the full
+      // coordinates map into Math.max would walk all 50,000 entries and
+      // allocate an array on every fallback frame.
+      let extent = 60;
+      for (const node of nodes) {
+        const point = coordinates.get(node.id);
+        if (point) extent = Math.max(extent, Math.hypot(point.x, point.y, point.z));
+      }
       const scale = Math.min(width, height) * 0.4 / extent;
       const projected = new Map(nodes.flatMap(node => {
         const p = coordinates.get(node.id);
@@ -256,14 +303,17 @@ export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles
       canvas.dataset.rotation = `${cameraRef.current.yaw.toFixed(3)},${cameraRef.current.pitch.toFixed(3)}`;
     };
 
+    /** Sync the scene, then draw the next frame on whichever renderer is live. */
     const render = () => {
       frame = 0;
       syncScene();
       if (renderer && sceneData) renderWebGL();
       else renderCanvas2D();
     };
+    /** Request one animation frame of rendering, coalescing duplicate requests. */
     const schedule = () => { if (!frame) frame = requestAnimationFrame(render); };
     redrawRef.current = schedule;
+    /** Resize both canvases to the CSS box (capped at 2x DPR) and redraw. */
     const resize = () => {
       const rect = canvas.getBoundingClientRect(); width = rect.width; height = rect.height;
       dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -274,6 +324,13 @@ export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles
       if (!renderer) canvas.getContext("2d")?.setTransform(dpr, 0, 0, dpr, 0, 0);
       schedule();
     };
+    /**
+     * Node id under a CSS-pixel pointer position, via GPU pick index or the
+     * Canvas 2D fallback's reverse z-order scan.
+     * @param x Pointer x in CSS pixels.
+     * @param y Pointer y in CSS pixels.
+     * @returns The hit node id, or null.
+     */
     const hit = (x: number, y: number) => {
       if (renderer && sceneData) {
         const index = renderer.pick(x, y);
@@ -281,6 +338,7 @@ export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles
       }
       return [...points].reverse().find(p => Math.hypot(p.x - x, p.y - y) < Math.max(7, p.radius + 3))?.id ?? null;
     };
+    /** Pointer position in canvas-local CSS pixels. */
     const local = (event: PointerEvent) => { const rect = canvas.getBoundingClientRect(); return { x: event.clientX - rect.left, y: event.clientY - rect.top }; };
     const down = (event: PointerEvent) => {
       canvas.focus(); canvas.setPointerCapture(event.pointerId);
@@ -313,6 +371,7 @@ export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles
         cameraRef.current.pitch += event.key === "ArrowUp" ? -0.15 : event.key === "ArrowDown" ? 0.15 : 0; schedule();
       } else if (event.key === "Enter") { const node = current.current.nodes.find(node => node.id === current.current.selectedNodeId) ?? current.current.nodes.find(node => isMemoryCoreLabel(node.label)); if (node) current.current.onSelectNode(node.id); }
     };
+    /** Fall back to Canvas 2D on WebGL context loss, keeping the view alive. */
     const contextLost = (event: Event) => {
       // Keep the view alive on the Canvas 2D fallback; allow the browser to restore.
       event.preventDefault();
@@ -322,6 +381,7 @@ export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles
       labelContext = null;
       schedule();
     };
+    /** Re-create the WebGL renderer when the browser restores the context. */
     const contextRestored = () => {
       if (!renderer && MemoryGraphWebGLRenderer.isSupported()) {
         try {
