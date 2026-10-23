@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   MemoryLayout3DSimulation,
   MemoryPickIndex,
+  buildStreamedMemoryPositions,
   collectMemoryLabelCandidates,
   layoutMemoryNetwork3D,
   memoryNodeRadius,
@@ -16,6 +17,7 @@ import { generateSyntheticMemoryGraph } from "../src/demo/synthetic-memory-graph
 import { isMemoryCoreLabel } from "../src/features/memory-workspace/memory-graph-visuals.js";
 import { memoryGraphEdgeSchema, memoryGraphNodeSchema, type MemoryGraphEdge, type MemoryGraphNode } from "@space/contracts";
 
+/** Small deterministic fixture graph for the 3D layout and projection tests. */
 function fixture(nodeCount = 127) {
   const nodes: MemoryGraphNode[] = [{ id: "root", label: "gemini.md", type: "SOURCE", sourcePath: "/opt/spaceapp/docs/gemini.md", recordId: null }];
   const edges: MemoryGraphEdge[] = [];
@@ -34,6 +36,7 @@ function fixture(nodeCount = 127) {
 }
 
 // Deterministic pseudo-random values in [0, 1).
+/** Deterministic pseudo-random generator (mulberry32) for repeatable fixtures. */
 const rand = (seed: number) => {
   let state = seed >>> 0;
   return () => {
@@ -73,6 +76,38 @@ describe("streaming 3D layout simulation", () => {
   });
 });
 
+describe("streamed scene position rebuild", () => {
+  it("matches a full repack exactly, including derived edge positions and extent", () => {
+    const { nodes, edges } = fixture(400);
+    const simulation = new MemoryLayout3DSimulation(nodes, edges);
+    const ids = simulation.nodeIds;
+    const indexById = new Map(ids.map((id, index) => [id, index]));
+    const visibleEdges = edges.filter(edge => indexById.has(edge.source) && indexById.has(edge.target));
+    const edgeNodeIndices = new Float32Array(visibleEdges.flatMap(edge => [indexById.get(edge.source)!, indexById.get(edge.target)!]));
+    simulation.step(12);
+    const coordinates = simulation.snapshot();
+    const streamed = buildStreamedMemoryPositions(ids, edgeNodeIndices, coordinates);
+    expect(streamed).not.toBeNull();
+    // Node positions are exactly the simulation's flat array for this snapshot.
+    expect(streamed!.positions).toEqual(simulation.positionsArray());
+    // Every derived edge endpoint equals its node's new position.
+    for (let vertex = 0; vertex < edgeNodeIndices.length; vertex++) {
+      const nodeIndex = edgeNodeIndices[vertex]!;
+      expect(streamed!.edgePositions[vertex * 3]).toBe(streamed!.positions[nodeIndex * 3]);
+      expect(streamed!.edgePositions[vertex * 3 + 1]).toBe(streamed!.positions[nodeIndex * 3 + 1]);
+      expect(streamed!.edgePositions[vertex * 3 + 2]).toBe(streamed!.positions[nodeIndex * 3 + 2]);
+    }
+    // The extent follows the new snapshot (it grows as the layout expands),
+    // never the first snapshot's.
+    const expectedExtent = Math.max(60, ...ids.map(id => { const p = coordinates.get(id)!; return Math.hypot(p.x, p.y, p.z); }));
+    expect(streamed!.extent).toBe(expectedExtent);
+    // A scene node without a coordinate yet aborts to the full rebuild.
+    const partial = new Map(coordinates);
+    partial.delete(ids[0]!);
+    expect(buildStreamedMemoryPositions(ids, edgeNodeIndices, partial)).toBeNull();
+  });
+});
+
 describe("batch projection", () => {
   it("matches projectMemoryPoint component for component", () => {
     const random = rand(42);
@@ -96,6 +131,7 @@ describe("batch projection", () => {
 });
 
 describe("spatial pick index", () => {
+  /** Build a pick index plus random projections for the probe tests. */
   const build = (count: number) => {
     const random = rand(7);
     const positions = new Float32Array(count * 3);
@@ -107,6 +143,7 @@ describe("spatial pick index", () => {
     index.rebuild(projected, radii);
     return { projected, radii, index };
   };
+  /** O(n) reference implementation the spatial pick index is verified against. */
   const bruteForce = (x: number, y: number, projected: Float32Array, radii: Float32Array) => {
     let best = -1, bestDepth = Number.POSITIVE_INFINITY, bestDistance = Number.POSITIVE_INFINITY;
     for (let i = 0; i < radii.length; i++) {
