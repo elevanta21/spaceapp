@@ -316,6 +316,15 @@ export const MEMORY_GRAPH_OVERVIEW_DEFAULT_LIMIT = 2000;
 export const MEMORY_GRAPH_OVERVIEW_MAX_LIMIT = 50000;
 
 // Keep the same payload budget while retaining the taxonomy needed to interpret a large archive.
+/**
+ * Choose which nodes the overview endpoint returns. Small graphs pass through
+ * untouched; large ones keep taxonomy-bearing nodes first (sources, topics,
+ * tagged memories, recent records) and fill the remainder in input order.
+ * @param nodes All matching nodes, pre-filtered by the endpoint.
+ * @param edges All matching edges; used to identify tagged and connected nodes.
+ * @param limit Maximum nodes to select; defaults to MEMORY_GRAPH_OVERVIEW_DEFAULT_LIMIT.
+ * @returns The selected nodes, in selection order.
+ */
 export function selectOverviewNodes(nodes: MemoryGraphNode[], edges: MemoryGraphEdge[], limit: number = MEMORY_GRAPH_OVERVIEW_DEFAULT_LIMIT): MemoryGraphNode[] {
   if (nodes.length <= limit) return nodes;
   const members = new Map<string, Set<string>>();
