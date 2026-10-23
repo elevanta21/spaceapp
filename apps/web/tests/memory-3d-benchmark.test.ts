@@ -30,6 +30,12 @@ const SIZES = [2_000, 10_000, 50_000];
 const WIDTH = 1440;
 const HEIGHT = 900;
 
+/**
+ * Nearest-rank percentile of a sorted sample set (p50/p95 frame-time math).
+ * @param samples Frame-time samples in milliseconds.
+ * @param ratio Percentile as a 0..1 fraction.
+ * @returns The sample at that percentile.
+ */
 function percentile(samples: number[], ratio: number): number {
   const sorted = [...samples].sort((a, b) => a - b);
   return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * ratio))]!;
