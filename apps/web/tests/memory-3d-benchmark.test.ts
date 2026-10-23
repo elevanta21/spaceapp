@@ -2,11 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   MemoryLayout3DSimulation,
   MemoryPickIndex,
+  collectMemoryLabelCandidates,
   memoryNodeRadius,
   projectMemoryPoints,
   selectMemoryLabels,
-  DEFAULT_MEMORY_CAMERA,
-  type MemoryLabelCandidate
+  DEFAULT_MEMORY_CAMERA
 } from "../src/features/memory-workspace/memory-3d.js";
 import { generateSyntheticMemoryGraph } from "../src/demo/synthetic-memory-graph.js";
 
@@ -15,6 +15,9 @@ import { generateSyntheticMemoryGraph } from "../src/demo/synthetic-memory-graph
  * measures the renderer's full CPU-side share of a frame — batch projection,
  * radius computation, pick-index rebuild, and label LOD selection — over
  * simulated rotating/zooming frames, plus picking latency and layout time.
+ * The label step runs the component's real path: collectMemoryLabelCandidates
+ * scans every node of the frame (the same helper drawLabels uses), so the
+ * numbers cover candidate construction as well as selection.
  * GPU rasterization itself is two draw calls (instanced nodes, batched
  * edges); on an integrated-GPU laptop the CPU share measured here is the
  * part that must stay well inside the 33 ms p95 budget.
@@ -41,6 +44,10 @@ describe("3D memory graph frame-time harness", () => {
       simulation.step(Number.POSITIVE_INFINITY);
       const layoutMs = performance.now() - layoutStart;
       const positions = simulation.positionsArray();
+      // Label candidates are collected from the nodes in simulation order,
+      // aligned with the projected points, exactly as the component does.
+      const nodeById = new Map(nodes.map(node => [node.id, node]));
+      const alignedNodes = simulation.nodeIds.map(id => nodeById.get(id)!);
       const extent = Math.max(60, ...Array.from({ length: size }, (_, i) =>
         Math.hypot(positions[i * 3]!, positions[i * 3 + 1]!, positions[i * 3 + 2]!)));
       const scale = Math.min(WIDTH, HEIGHT) * 0.4 / extent;
@@ -62,17 +69,7 @@ describe("3D memory graph frame-time harness", () => {
           radii[i] = memoryNodeRadius(2.1, projected[i * 4 + 3]!, camera.zoom, false);
         }
         pickIndex.rebuild(projected, radii);
-        const labelCandidates: MemoryLabelCandidate[] = [];
-        for (let i = 0; i < size; i += 97) {
-          labelCandidates.push({
-            id: nodes[i]!.id,
-            label: nodes[i]!.label,
-            type: nodes[i]!.type,
-            core: nodes[i]!.label === "space.md",
-            x: projected[i * 4]!,
-            y: projected[i * 4 + 1]!
-          });
-        }
+        const labelCandidates = collectMemoryLabelCandidates(alignedNodes, projected, { zoom: camera.zoom });
         selectMemoryLabels(labelCandidates, {
           zoom: camera.zoom, width: WIDTH, height: HEIGHT, measure: text => text.length * 6
         });

@@ -2,15 +2,18 @@ import { describe, expect, it } from "vitest";
 import {
   MemoryLayout3DSimulation,
   MemoryPickIndex,
+  collectMemoryLabelCandidates,
   layoutMemoryNetwork3D,
   memoryNodeRadius,
   projectMemoryPoint,
   projectMemoryPoints,
   selectMemoryLabels,
   DEFAULT_MEMORY_CAMERA,
+  MEMORY_LABEL_CANDIDATE_CAP,
   type MemoryLabelCandidate
 } from "../src/features/memory-workspace/memory-3d.js";
 import { generateSyntheticMemoryGraph } from "../src/demo/synthetic-memory-graph.js";
+import { isMemoryCoreLabel } from "../src/features/memory-workspace/memory-graph-visuals.js";
 import { memoryGraphEdgeSchema, memoryGraphNodeSchema, type MemoryGraphEdge, type MemoryGraphNode } from "@space/contracts";
 
 function fixture(nodeCount = 127) {
@@ -197,6 +200,33 @@ describe("label level-of-detail selection", () => {
         expect(collides).toBe(false);
       }
     }
+  });
+
+  it("collects a bounded candidate set that selects exactly the same labels", () => {
+    const { nodes, edges } = fixture(4000);
+    const simulation = new MemoryLayout3DSimulation(nodes, edges);
+    simulation.step(Number.POSITIVE_INFINITY);
+    const projected = projectMemoryPoints(simulation.positionsArray(), DEFAULT_MEMORY_CAMERA, 2, 1200, 800);
+    const nodeById = new Map(nodes.map(node => [node.id, node]));
+    const aligned = simulation.nodeIds.map(id => nodeById.get(id)!);
+    const options = { focusId: aligned[10]!.id, zoom: 1, width: 1200, height: 800, measure: (text: string) => text.length * 6 };
+    // The naive per-frame path: one candidate object for every node.
+    const naive: MemoryLabelCandidate[] = aligned.map((node, index) => ({
+      id: node.id,
+      label: node.label,
+      type: node.type,
+      core: isMemoryCoreLabel(node.label),
+      x: projected[index * 4]!,
+      y: projected[index * 4 + 1]!
+    }));
+    const collected = collectMemoryLabelCandidates(aligned, projected, options);
+    expect(collected.length).toBeLessThanOrEqual(MEMORY_LABEL_CANDIDATE_CAP);
+    expect(collected[0]!.id).toBe(options.focusId);
+    expect(selectMemoryLabels(collected, options)).toEqual(selectMemoryLabels(naive, options));
+    const highZoom = { ...options, zoom: 2.5 };
+    const collectedHigh = collectMemoryLabelCandidates(aligned, projected, highZoom);
+    expect(collectedHigh.length).toBe(MEMORY_LABEL_CANDIDATE_CAP);
+    expect(selectMemoryLabels(collectedHigh, highZoom)).toEqual(selectMemoryLabels(naive, highZoom));
   });
 });
 
