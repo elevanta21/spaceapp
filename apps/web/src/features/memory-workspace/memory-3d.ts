@@ -33,6 +33,7 @@ export class MemoryLayout3DSimulation {
   private readonly fy: Float64Array;
   private readonly fz: Float64Array;
 
+  /** Seed the simulation from deterministic per-node offsets so the same input always converges to the same layout. */
   constructor(nodes: MemoryGraphNode[], edges: MemoryGraphEdge[]) {
     const ordered = [...nodes].sort((a, b) => a.id.localeCompare(b.id));
     const index = new Map(ordered.map((node, i) => [node.id, i]));
@@ -136,6 +137,7 @@ export class MemoryLayout3DSimulation {
     return out;
   }
 
+  /** A defensive copy of the current simulation positions, keyed by node id. */
   snapshot(): Map<string, MemoryPoint3D> {
     return new Map(this.ordered.map((node, i) => [node.id, { ...this.points[i]! }]));
   }
@@ -148,6 +150,16 @@ export function layoutMemoryNetwork3D(nodes: MemoryGraphNode[], edges: MemoryGra
   return simulation.snapshot();
 }
 
+/**
+ * Project one world point to screen space with the shared yaw/pitch camera.
+ * Same math as the batch and WebGL paths, so all three renderers agree.
+ * @param point World-space point to project.
+ * @param camera Camera orientation (yaw/pitch) and zoom.
+ * @param scale World-units to CSS pixels at zoom 1.
+ * @param width Viewport width in CSS pixels.
+ * @param height Viewport height in CSS pixels.
+ * @returns Screen x/y, depth z, and the perspective divisor.
+ */
 export function projectMemoryPoint(point: MemoryPoint3D, camera: MemoryCamera3D, scale: number, width: number, height: number) {
   const x = point.x * Math.cos(camera.yaw) + point.z * Math.sin(camera.yaw);
   const depth = -point.x * Math.sin(camera.yaw) + point.z * Math.cos(camera.yaw);
@@ -198,6 +210,11 @@ export class MemoryPickIndex {
   private maxRadius = 0;
   constructor(private readonly cellSize = 64) {}
 
+  /**
+   * Fill the grid cells from one rendered frame.
+   * @param projected [x, y, depth, perspective] quads from the last render.
+   * @param radii On-screen node radii in CSS pixels.
+   */
   rebuild(projected: Float32Array, radii: Float32Array): void {
     this.cells.clear();
     this.maxRadius = 0;
@@ -326,26 +343,78 @@ export function collectMemoryLabelCandidates(
     const node = nodes[index]!;
     const isFocus = node.id === focusId;
     if (!isFocus && node.type !== "SOURCE" && options.zoom < 1.6) continue;
-    const candidate: MemoryLabelCandidate = {
+    const isCore = isMemoryCoreLabel(node.label);
+    // Choose the priority group before allocating: the returned list keeps
+    // the first MEMORY_LABEL_CANDIDATE_CAP candidates in group order, and a
+    // node sits behind its own group plus every higher-priority group, so
+    // once that lower bound reaches the cap the candidate would only be
+    // sliced away below — don't allocate an object for it.
+    let bucket: MemoryLabelCandidate[];
+    let ahead: number;
+    if (isFocus) { bucket = focus; ahead = 0; }
+    else if (isCore) { bucket = core; ahead = focus.length; }
+    else if (node.type === "SOURCE") { bucket = sources; ahead = focus.length + core.length; }
+    else { bucket = rest; ahead = focus.length + core.length + sources.length; }
+    if (ahead + bucket.length >= MEMORY_LABEL_CANDIDATE_CAP) continue;
+    bucket.push({
       id: node.id,
       label: node.label,
       type: node.type,
-      core: isMemoryCoreLabel(node.label),
+      core: isCore,
       x: projected[index * 4]!,
       y: projected[index * 4 + 1]!
-    };
-    if (isFocus) focus.push(candidate);
-    else if (candidate.core) core.push(candidate);
-    else if (node.type === "SOURCE") sources.push(candidate);
-    else rest.push(candidate);
+    });
   }
   return [...focus, ...core, ...sources, ...rest].slice(0, MEMORY_LABEL_CANDIDATE_CAP);
+}
+
+/**
+ * Streaming fast path for scene sync: when only the layout coordinates
+ * changed, rebuild just the flat position arrays from the previous scene's
+ * node order and edge index table instead of repacking the whole scene
+ * (colors, sizes, neighbor sets) on every snapshot. The derived edge
+ * positions and the world extent are rebuilt alongside the node positions,
+ * so nothing rendered from the old snapshot survives. Returns null when a
+ * scene node has no coordinate yet — the caller then does a full rebuild,
+ * which handles partial coordinates.
+ * @param ids Node ids in scene order.
+ * @param edgeNodeIndices Node index per edge vertex, two per edge.
+ * @param coordinates The new layout coordinates keyed by node id.
+ * @returns New position/edge-position arrays and the new extent, or null.
+ */
+export function buildStreamedMemoryPositions(
+  ids: string[],
+  edgeNodeIndices: Float32Array,
+  coordinates: Map<string, MemoryPoint3D>
+): { positions: Float32Array; edgePositions: Float32Array; extent: number } | null {
+  const positions = new Float32Array(ids.length * 3);
+  let extent = 60;
+  for (let index = 0; index < ids.length; index++) {
+    const point = coordinates.get(ids[index]!);
+    if (!point) return null;
+    positions[index * 3] = point.x;
+    positions[index * 3 + 1] = point.y;
+    positions[index * 3 + 2] = point.z;
+    extent = Math.max(extent, Math.hypot(point.x, point.y, point.z));
+  }
+  const edgePositions = new Float32Array(edgeNodeIndices.length * 3);
+  for (let vertex = 0; vertex < edgeNodeIndices.length; vertex++) {
+    const nodeIndex = edgeNodeIndices[vertex]!;
+    edgePositions[vertex * 3] = positions[nodeIndex * 3]!;
+    edgePositions[vertex * 3 + 1] = positions[nodeIndex * 3 + 1]!;
+    edgePositions[vertex * 3 + 2] = positions[nodeIndex * 3 + 2]!;
+  }
+  return { positions, edgePositions, extent };
 }
 
 /** Normalized covariance determinant: 0 for a plane, 1 for equal spread in XYZ. */
 export function memory3DVolumeRatio(points: MemoryPoint3D[]): number {
   if (points.length < 4) return 0;
-  const center = points.reduce((sum, p) => ({ x: sum.x + p.x / points.length, y: sum.y + p.y / points.length, z: sum.z + p.z / points.length }), { x: 0, y: 0, z: 0 });
+  // Scalar accumulation: a per-point object-building reduce allocates one
+  // object per node on every call, and this runs per streamed snapshot.
+  let sumX = 0, sumY = 0, sumZ = 0;
+  for (const p of points) { sumX += p.x; sumY += p.y; sumZ += p.z; }
+  const center = { x: sumX / points.length, y: sumY / points.length, z: sumZ / points.length };
   let xx = 0, yy = 0, zz = 0, xy = 0, xz = 0, yz = 0;
   for (const p of points) {
     const x = p.x - center.x, y = p.y - center.y, z = p.z - center.z;
