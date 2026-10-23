@@ -673,6 +673,11 @@ export class DemoStore {
     };
   }
 
+  /**
+   * Demo URL override for scale benchmarks: ?demoGraphSize=50000 renders a
+   * synthetic graph of that size instead of the fixture graph.
+   * @returns The requested node count, or undefined for a missing/invalid value.
+   */
   private demoGraphSizeFromUrl(): number | undefined {
     try {
       if (typeof window === "undefined") return undefined;
