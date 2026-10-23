@@ -25,6 +25,11 @@ export interface MemoryWebGLScene {
   extent: number;
 }
 
+/**
+ * Parse a #rrggbb CSS color into 0..1 RGB components; a muted slate on bad input.
+ * @param hex CSS hex color, with or without the leading "#".
+ * @returns [r, g, b] triple in 0..1.
+ */
 export function hexToRgb(hex: string): [number, number, number] {
   const value = Number.parseInt(hex.replace("#", ""), 16);
   if (!Number.isFinite(value)) return [0.45, 0.58, 0.68];
@@ -128,6 +133,13 @@ void main() {
   outColor = vec4(vColor, 1.0);
 }`;
 
+/**
+ * Compile one GLSL shader, throwing with the driver log on failure.
+ * @param gl The WebGL2 context.
+ * @param type gl.VERTEX_SHADER or gl.FRAGMENT_SHADER.
+ * @param source GLSL 300 es source.
+ * @returns The compiled shader.
+ */
 function compileShader(gl: WebGL2RenderingContext, type: number, source: string): WebGLShader {
   const shader = gl.createShader(type);
   if (!shader) throw new Error("WebGL2 shader allocation failed");
@@ -141,14 +153,29 @@ function compileShader(gl: WebGL2RenderingContext, type: number, source: string)
   return shader;
 }
 
+/**
+ * Link a vertex and fragment shader into a program, throwing on failure.
+ * @param gl The WebGL2 context.
+ * @param vertex Vertex shader GLSL source.
+ * @param fragment Fragment shader GLSL source.
+ * @returns The linked program.
+ */
 function createProgram(gl: WebGL2RenderingContext, vertex: string, fragment: string): WebGLProgram {
   const program = gl.createProgram();
   if (!program) throw new Error("WebGL2 program allocation failed");
-  gl.attachShader(program, compileShader(gl, gl.VERTEX_SHADER, vertex));
-  gl.attachShader(program, compileShader(gl, gl.FRAGMENT_SHADER, fragment));
+  const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vertex);
+  const fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, fragment);
+  gl.attachShader(program, vertexShader);
+  gl.attachShader(program, fragmentShader);
   gl.linkProgram(program);
+  // The shaders are linked into the program now; release the shader objects
+  // so repeated renderer creation (context restore) does not leak them.
+  gl.deleteShader(vertexShader);
+  gl.deleteShader(fragmentShader);
   if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-    throw new Error(`WebGL2 program failed to link: ${gl.getProgramInfoLog(program) ?? "unknown error"}`);
+    const log = gl.getProgramInfoLog(program);
+    gl.deleteProgram(program);
+    throw new Error(`WebGL2 program failed to link: ${log ?? "unknown error"}`);
   }
   return program;
 }
@@ -215,6 +242,12 @@ export class MemoryGraphWebGLRenderer {
     gl.bindVertexArray(null);
   }
 
+  /**
+   * Allocate a GPU buffer, upload `data`, and track it for disposal.
+   * @param data Float32 data to upload.
+   * @param usage gl.STATIC_DRAW or gl.DYNAMIC_DRAW hint.
+   * @returns The created buffer.
+   */
   private createBuffer(data: Float32Array, usage: number): WebGLBuffer {
     const gl = this.gl;
     const buffer = gl.createBuffer();
@@ -225,6 +258,16 @@ export class MemoryGraphWebGLRenderer {
     return buffer;
   }
 
+  /**
+   * Bind one per-node attribute as an instanced divisor-1 stream.
+   * @param program The shader program owning the attribute.
+   * @param vao Vertex array to attach the buffer to.
+   * @param name Attribute name in the shader.
+   * @param data Per-node data, one `size`-tuple per node.
+   * @param size Components per attribute (1, 2, or 3).
+   * @param usage gl.STATIC_DRAW or gl.DYNAMIC_DRAW hint.
+   * @returns The created buffer.
+   */
   private bindInstanced(program: WebGLProgram, vao: WebGLVertexArrayObject, name: string, data: Float32Array, size: number, usage: number): WebGLBuffer {
     const gl = this.gl;
     gl.bindVertexArray(vao);
@@ -237,6 +280,16 @@ export class MemoryGraphWebGLRenderer {
     return buffer;
   }
 
+  /**
+   * Bind one per-vertex attribute (the batched edge lines), non-instanced.
+   * @param program The shader program owning the attribute.
+   * @param vao Vertex array to attach the buffer to.
+   * @param name Attribute name in the shader.
+   * @param data Per-vertex data, one `size`-tuple per vertex.
+   * @param size Components per attribute (1 or 3).
+   * @param usage Upload hint, defaults to gl.STATIC_DRAW.
+   * @returns The created buffer.
+   */
   private bindVertex(program: WebGLProgram, vao: WebGLVertexArrayObject, name: string, data: Float32Array, size: number, usage: number = this.gl.STATIC_DRAW): WebGLBuffer {
     const gl = this.gl;
     gl.bindVertexArray(vao);
@@ -248,6 +301,10 @@ export class MemoryGraphWebGLRenderer {
     return buffer;
   }
 
+  /**
+   * Upload a full scene, retiring the previous scene's GPU buffers.
+   * @param scene Packed node/edge data; arrays are uploaded as-is.
+   */
   setScene(scene: MemoryWebGLScene): void {
     const gl = this.gl;
     // Retire the previous scene's dynamic buffers.
@@ -274,10 +331,16 @@ export class MemoryGraphWebGLRenderer {
     this.radii = new Float32Array(this.nodeCount);
   }
 
-  /** Update node and edge positions in place while the layout streams in. */
-  updatePositions(positions: Float32Array, edgePositions: Float32Array): void {
+  /**
+   * Update node and edge positions in place while the layout streams in.
+   * @param positions New flat XYZ node positions.
+   * @param edgePositions New flat XYZ edge endpoint positions.
+   * @param extent New world-space extent; the depth range derives from it,
+   * so it must follow the streamed positions, not the first snapshot's.
+   */
+  updatePositions(positions: Float32Array, edgePositions: Float32Array, extent?: number): void {
     if (!this.scene) return;
-    this.scene = { ...this.scene, positions, edgePositions };
+    this.scene = { ...this.scene, positions, edgePositions, ...(extent !== undefined ? { extent } : {}) };
     const gl = this.gl;
     gl.bindVertexArray(this.nodeVao);
     // The aPos buffer is the first dynamic buffer created for the scene.
@@ -294,6 +357,15 @@ export class MemoryGraphWebGLRenderer {
       gl.bufferData(gl.ARRAY_BUFFER, edgePositions, gl.DYNAMIC_DRAW);
       gl.bindBuffer(gl.ARRAY_BUFFER, null);
     }
+  }
+
+  /** Drop the scene and clear the frame, e.g. when the graph becomes empty. */
+  clear(): void {
+    this.scene = null;
+    this.projected = new Float32Array(0);
+    const gl = this.gl;
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
   }
 
   /** Focus a node index (or -1 for none); neighbors stay lit, the rest dim. */
@@ -315,6 +387,14 @@ export class MemoryGraphWebGLRenderer {
     gl.bufferSubData(gl.ARRAY_BUFFER, 0, highlight);
   }
 
+  /**
+   * Draw edges (depth-write off) then the instanced node billboards, and
+   * refresh the CPU-side projection used for picking and labels.
+   * @param camera Camera orientation and zoom.
+   * @param scale World-units to CSS pixels at zoom 1.
+   * @param width Viewport width in CSS pixels.
+   * @param height Viewport height in CSS pixels.
+   */
   render(camera: MemoryCamera3D, scale: number, width: number, height: number): void {
     const gl = this.gl;
     if (!this.scene) return;
@@ -359,7 +439,9 @@ export class MemoryGraphWebGLRenderer {
     // CPU projection of the same frame powers picking and label placement.
     this.projected = projectMemoryPoints(this.scene.positions, camera, scale, width, height);
     for (let i = 0; i < this.nodeCount; i++) {
-      this.radii[i] = memoryNodeRadius(this.scene.baseSizes[i]!, this.projected[i * 4 + 3]!, camera.zoom, false);
+      // Pick radii must match the drawn radii, including the focused node's
+      // 1.5x highlight, or clicks on its rim would miss the pick index.
+      this.radii[i] = memoryNodeRadius(this.scene.baseSizes[i]!, this.projected[i * 4 + 3]!, camera.zoom, i === this.focusIndexValue);
     }
     this.pickIndex.rebuild(this.projected, this.radii);
   }
@@ -377,6 +459,7 @@ export class MemoryGraphWebGLRenderer {
     return this.projected;
   }
 
+  /** Delete every GPU resource this renderer allocated. */
   dispose(): void {
     const gl = this.gl;
     for (const buffer of this.buffers.splice(0)) gl.deleteBuffer(buffer);
