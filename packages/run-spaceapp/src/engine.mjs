@@ -88,18 +88,21 @@ export function podmanInfoFacts(info) {
 
 /**
  * The sizing facts of a Podman machine, from `podman machine inspect` (a JSON array; Memory is MiB and
- * DiskSize is GiB in the machine definition). Returns null when there is no machine to inspect.
+ * DiskSize is GiB in the machine definition). Sizing lives under Resources — only Name/State are top-level —
+ * so top-level fields are read only as a fallback for older output shapes. Returns null when there is no
+ * machine to inspect.
  */
 export function podmanMachineFacts(inspect) {
   const machine = Array.isArray(inspect) ? inspect[0] : inspect;
   if (!machine || typeof machine !== "object") {
     return null;
   }
-  const memoryMiB = Number(machine.Memory);
-  const diskGiB = Number(machine.DiskSize);
+  const resources = machine.Resources && typeof machine.Resources === "object" ? machine.Resources : machine;
+  const memoryMiB = Number(resources.Memory);
+  const diskGiB = Number(resources.DiskSize);
   return {
     name: typeof machine.Name === "string" ? machine.Name : null,
-    cpus: Number.isFinite(Number(machine.CPUs)) ? Number(machine.CPUs) : null,
+    cpus: Number.isFinite(Number(resources.CPUs)) ? Number(resources.CPUs) : null,
     memoryBytes: Number.isFinite(memoryMiB) ? memoryMiB * 1024 ** 2 : null,
     diskBytes: Number.isFinite(diskGiB) ? diskGiB * 1024 ** 3 : null,
     running: machine.Running === true || machine.State === "running"
@@ -181,7 +184,7 @@ export async function probeCgroupDelegation({
 
 /** The refusal text for an in-place engine switch: volumes are engine-private, so the data would vanish. */
 export function engineSwitchRefusal(existingEngine, requestedEngine) {
-  const other = requestedEngine === "podman" ? "podman" : existingEngine;
+  const other = requestedEngine;
   return (
     `Switching container engines on an existing installation is refused: ${existingEngine} volumes are not ` +
     `visible to ${other}, so the existing SpaceApp data would be stranded. To migrate engines instead: ` +
