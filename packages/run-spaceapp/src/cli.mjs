@@ -445,7 +445,7 @@ export async function run(argv, {
 
   if (["up", "down", "status", "logs"].includes(command)) {
     assertNoArgs(args, command);
-    return runtimeExecute(composeCommand(command, root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: engineOf(config), engine: engineOf(config), engine: engineOf(config), engine: engineOf(config), engine: engineOf(config) }), { stdin, stdout, stderr });
+    return runtimeExecute(composeCommand(command, root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: engineOf(config) }), { stdin, stdout, stderr });
   }
   if (command === "open") {
     assertNoArgs(args, "open");
@@ -793,12 +793,15 @@ async function installCommand(args, {
   let prerequisiteResult;
   if (engine === "podman") {
     prerequisiteResult = await ensurePodman({ platform, stdout, stderr, execute });
-  } else if (!existingConfig && requestedEngine === undefined && accessMode !== "host-root") {
+  } else if (!existingConfig && requestedEngine === undefined && accessMode !== "host-root" && platform !== "win32") {
     // No engine was chosen and Docker is the default: when Docker is absent but a supported Podman is
-    // ready, pick Podman and say so loudly, instead of failing into a Docker install. The probes go through
+    // ready, pick Podman and say so loudly, instead of failing into a Docker install. The Docker check is CLI
+    // presence (`docker --version`): `docker info` also fails when Docker is installed but its daemon is
+    // stopped, and a stopped daemon must fall through to the Docker path, not silently switch the saved engine.
+    // Podman is never picked on Windows (unsupported there). The probes go through
     // captureProbe (timeout-tagged, output-parsed): a bare exit code is not enough — the version must parse.
-    const dockerInfo = await captureProbe(execute, { command: "docker", args: ["info"] });
-    if (dockerInfo === null) {
+    const dockerCli = await captureProbe(execute, { command: "docker", args: ["--version"] });
+    if (dockerCli === null) {
       const podmanVersion = parseEngineVersion(await captureProbe(execute, { command: "podman", args: ["--version"] }) ?? "");
       const podmanReady = podmanVersion !== null && versionAtLeast(podmanVersion, PODMAN_MIN_VERSION)
         && await captureProbe(execute, { command: "podman", args: ["compose", "version"] }) !== null
