@@ -14,6 +14,7 @@ import {
   PODMAN_COMPOSE_PROVIDER,
   PODMAN_MIN_VERSION,
   parseEngineVersion,
+  podmanInfoFacts,
   podmanInstallInstructions,
   versionAtLeast
 } from "./engine.mjs";
@@ -251,7 +252,14 @@ export async function ensurePodmanAvailable({
     );
     return { code: 1, reexecuted: false };
   }
-  if (await execute({ command: "podman", args: ["compose", "version"] }, { stdout: null, stderr: null }) !== 0) {
+  // A zero exit code alone does not prove the provider: `podman compose` also delegates to podman-compose
+  // (the Python tool) when that is the host's provider, and it is not supported. Require the output to
+  // identify Docker Compose v2.
+  const composeProbe = await captureProbeOutput({ command: "podman", args: ["compose", "version"] }, execute);
+  if (
+    composeProbe.code !== 0 ||
+    !/\bDocker Compose version v?2\.\d+\.\d+\b/.test(composeProbe.output)
+  ) {
     stderr.write(
       "`podman compose` has no working provider. SpaceApp drives Compose through " +
       `${PODMAN_COMPOSE_PROVIDER}; install Docker Compose v2 (the standalone docker-compose binary or the ` +
@@ -272,6 +280,28 @@ export async function ensurePodmanAvailable({
         "provider connects to, then rerun the installer:\n" +
         "  systemctl --user enable --now podman.socket\n" +
         "and confirm `podman info` succeeds.\n"
+      );
+    }
+    return { code: 1, reexecuted: false };
+  }
+  // Reachable is not enough: the launcher requires rootless Podman, and a rootful engine must not slip
+  // through on an exit code. Fail closed when the rootless state is rootful or cannot be determined.
+  const infoProbe = await captureProbeOutput({ command: "podman", args: ["info", "--format", "{{json .}}"] }, execute);
+  let infoFacts = null;
+  try {
+    infoFacts = podmanInfoFacts(JSON.parse(infoProbe.output));
+  } catch {
+    // infoFacts stays null: unparseable info counts as unknown, and is rejected below.
+  }
+  if (infoFacts?.rootless !== true) {
+    if (infoFacts && infoFacts.rootless === false) {
+      stderr.write(
+        "Podman is running rootful. SpaceApp requires rootless Podman: rerun the installer as a non-root " +
+        "user with the rootless socket enabled (`systemctl --user enable --now podman.socket`), or install with the Docker engine.\n"
+      );
+    } else {
+      stderr.write(
+        "Podman is installed but its rootless state could not be determined. Confirm `podman info` succeeds and rerun the installer.\n"
       );
     }
     return { code: 1, reexecuted: false };
