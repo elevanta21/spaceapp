@@ -163,6 +163,10 @@ function podmanExecute(calls) {
       io?.stdout?.write?.("podman version 5.2.2\n");
       return 0;
     }
+    if (spec.args[0] === "compose" && spec.args[1] === "version") {
+      io?.stdout?.write?.("Docker Compose version v2.39.1\n");
+      return 0;
+    }
     if (spec.args[0] === "info" && spec.args.includes("--format")) {
       io?.stdout?.write?.(JSON.stringify(PODMAN_INFO));
       return 0;
@@ -205,6 +209,7 @@ test("engine selection: explicit wins, stored is kept, unknown is refused", () =
   assert.equal(resolveInstallEngine("podman", "docker"), "podman");
   assert.throws(() => resolveInstallEngine("nerdctl"), /must be docker or podman/);
   assert.match(engineSwitchRefusal("docker", "podman"), /not\s+visible to podman/);
+  assert.match(engineSwitchRefusal("podman", "docker"), /not\s+visible to docker/);
   assert.match(engineSwitchRefusal("docker", "podman"), /uninstall --purge-data/);
 });
 
@@ -225,13 +230,13 @@ test("podman info facts are extracted from the Podman 5 info document", () => {
 
 test("podman machine facts are sized against the profile and resizing is explained", () => {
   const requirements = { cpuCount: 4, memoryBytes: 7 * 1024 ** 3, freshDiskBytes: 6.5 * 1024 ** 3 };
-  const small = podmanMachineFacts([{ Name: "podman-machine-default", CPUs: 2, Memory: 2048, DiskSize: 20, Running: true }]);
+  const small = podmanMachineFacts([{ Name: "podman-machine-default", Resources: { CPUs: 2, Memory: 2048, DiskSize: 20 }, Running: true }]);
   assert.equal(small.cpus, 2);
   assert.equal(small.memoryBytes, 2048 * 1024 ** 2);
   const failing = podmanMachineCheck(small, requirements);
   assert.equal(failing.ok, false);
   assert.match(failing.guidance, /podman machine set --cpus 4 --memory 7168 --disk-size 7/);
-  const adequate = podmanMachineFacts([{ Name: "m", CPUs: 8, Memory: 16384, DiskSize: 100, Running: true }]);
+  const adequate = podmanMachineFacts([{ Name: "m", Resources: { CPUs: 8, Memory: 16384, DiskSize: 100 }, Running: true }]);
   assert.equal(podmanMachineCheck(adequate, requirements).ok, true);
   const missing = podmanMachineCheck(null, requirements);
   assert.equal(missing.ok, false);
@@ -402,12 +407,95 @@ test("ensurePodmanAvailable gates on presence, version floor, compose provider, 
         io?.stdout?.write?.("podman version 5.2.2\n");
         return 0;
       }
+      if (spec.args[0] === "compose") {
+        io?.stdout?.write?.("Docker Compose version v2.39.1\n");
+        return 0;
+      }
       if (spec.args[0] === "info") return 1;
       return 0;
     }
   });
   assert.equal(unreachable.code, 1);
   assert.match(socketStderr.value(), /podman\.socket/);
+
+  // A zero exit from `podman compose version` is not enough: the Python podman-compose provider
+  // exits 0 too, and it is not supported — only Docker Compose v2 output passes.
+  const pythonProviderStderr = capture();
+  const pythonProvider = await ensurePodmanAvailable({
+    platform: "linux",
+    stdout: capture().stream,
+    stderr: pythonProviderStderr.stream,
+    execute: async (spec, io) => {
+      if (spec.args[0] === "--version") {
+        io?.stdout?.write?.("podman version 5.2.2\n");
+        return 0;
+      }
+      if (spec.args[0] === "compose") {
+        io?.stdout?.write?.("podman-compose version: 1.5.0\nusing podman version: 5.2.2\n");
+        return 0;
+      }
+      return 0;
+    }
+  });
+  assert.equal(pythonProvider.code, 1);
+  assert.match(pythonProviderStderr.value(), /podman-compose \(the Python tool\) is not a supported provider/);
+
+  // Rootful Podman must not pass the prerequisite gate, even though `podman info` succeeds.
+  const rootfulStderr = capture();
+  const rootful = await ensurePodmanAvailable({
+    platform: "linux",
+    stdout: capture().stream,
+    stderr: rootfulStderr.stream,
+    execute: async (spec, io) => {
+      if (spec.args[0] === "--version") {
+        io?.stdout?.write?.("podman version 5.2.2\n");
+        return 0;
+      }
+      if (spec.args[0] === "compose") {
+        io?.stdout?.write?.("Docker Compose version v2.39.1\n");
+        return 0;
+      }
+      if (spec.args[0] === "info" && spec.args.includes("--format")) {
+        io?.stdout?.write?.(JSON.stringify({
+          ...PODMAN_INFO,
+          host: { ...PODMAN_INFO.host, security: { rootless: false } }
+        }));
+        return 0;
+      }
+      return 0;
+    }
+  });
+  assert.equal(rootful.code, 1);
+  assert.match(rootfulStderr.value(), /running rootful/);
+
+  // An info document that does not establish rootless fails closed, too.
+  const unknownStderr = capture();
+  const unknown = await ensurePodmanAvailable({
+    platform: "linux",
+    stdout: capture().stream,
+    stderr: unknownStderr.stream,
+    execute: async (spec, io) => {
+      if (spec.args[0] === "--version") {
+        io?.stdout?.write?.("podman version 5.2.2\n");
+        return 0;
+      }
+      if (spec.args[0] === "compose") {
+        io?.stdout?.write?.("Docker Compose version v2.39.1\n");
+        return 0;
+      }
+      if (spec.args[0] === "info" && spec.args.includes("--format")) {
+        io?.stdout?.write?.(JSON.stringify({
+          version: { Version: "5.2.2" },
+          host: { cgroupVersion: "v2", cpus: 8, memTotal: 16 * 1024 ** 3, arch: "amd64" },
+          store: { graphRoot: "/home/spaceuser/.local/share/containers/storage" }
+        }));
+        return 0;
+      }
+      return 0;
+    }
+  });
+  assert.equal(unknown.code, 1);
+  assert.match(unknownStderr.value(), /could not be determined/);
 
   const windows = await ensurePodmanAvailable({
     platform: "win32",
@@ -537,6 +625,26 @@ test("install --engine podman runs the whole flow on Podman and persists the eng
   });
   assert.equal(statusCode, 0);
   assert.ok(statusCalls.every((spec) => spec.command === "podman"));
+});
+
+test("install without --engine picks Podman when the Docker CLI is absent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "spaceapp-podman-autopick-"));
+  const stdout = capture();
+  const code = await run(["install", "--profile", "small", "--no-open"], {
+    env: { SPACEAPP_HOME: root },
+    platform: "linux",
+    stdout: stdout.stream,
+    stderr: capture().stream,
+    stdin: ttyStdin(...FRESH_APPROVALS),
+    inspectResources: async () => GENEROUS_RESOURCES,
+    request: readyRequest,
+    sleep: async () => {},
+    execute: podmanExecute(null)
+  });
+  assert.equal(code, 0);
+  assert.match(stdout.value(), /Docker is not available, but Podman is/);
+  const config = JSON.parse(await readFile(join(root, "config.json"), "utf8"));
+  assert.equal(config.engine, "podman");
 });
 
 test("switching engines on an existing installation is refused with the migration path", async () => {
