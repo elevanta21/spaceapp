@@ -440,6 +440,51 @@ test("ensurePodmanAvailable gates on presence, version floor, compose provider, 
   assert.equal(pythonProvider.code, 1);
   assert.match(pythonProviderStderr.value(), /podman-compose \(the Python tool\) is not a supported provider/);
 
+  // Docker Compose v5 must pass the gate too (the v2-only pattern rejected it), with or without
+  // the `v` prefix; v1 must still be rejected.
+  for (const composeOutput of ["Docker Compose version v5.6.1\n", "Docker Compose version 5.0.0\n"]) {
+    const v5 = await ensurePodmanAvailable({
+      platform: "linux",
+      stdout: capture().stream,
+      stderr: capture().stream,
+      execute: async (spec, io) => {
+        if (spec.args[0] === "--version") {
+          io?.stdout?.write?.("podman version 5.2.2\n");
+          return 0;
+        }
+        if (spec.args[0] === "compose") {
+          io?.stdout?.write?.(composeOutput);
+          return 0;
+        }
+        if (spec.args[0] === "info" && spec.args.includes("--format")) {
+          io?.stdout?.write?.(JSON.stringify(PODMAN_INFO));
+          return 0;
+        }
+        return 0;
+      }
+    });
+    assert.equal(v5.code, 0, composeOutput);
+  }
+  const v1Stderr = capture();
+  const v1 = await ensurePodmanAvailable({
+    platform: "linux",
+    stdout: capture().stream,
+    stderr: v1Stderr.stream,
+    execute: async (spec, io) => {
+      if (spec.args[0] === "--version") {
+        io?.stdout?.write?.("podman version 5.2.2\n");
+        return 0;
+      }
+      if (spec.args[0] === "compose") {
+        io?.stdout?.write?.("Docker Compose version v1.29.2\n");
+        return 0;
+      }
+      return 0;
+    }
+  });
+  assert.equal(v1.code, 1);
+  assert.match(v1Stderr.value(), /podman-compose \(the Python tool\) is not a supported provider/);
+
   // Rootful Podman must not pass the prerequisite gate, even though `podman info` succeeds.
   const rootfulStderr = capture();
   const rootful = await ensurePodmanAvailable({
