@@ -254,15 +254,15 @@ export async function ensurePodmanAvailable({
   }
   // A zero exit code alone does not prove the provider: `podman compose` also delegates to podman-compose
   // (the Python tool) when that is the host's provider, and it is not supported. Require the output to
-  // identify Docker Compose v2.
+  // identify Docker Compose v2 or later (v5 exists now; the gate must not pin the major version).
   const composeProbe = await captureProbeOutput({ command: "podman", args: ["compose", "version"] }, execute);
   if (
     composeProbe.code !== 0 ||
-    !/\bDocker Compose version v?2\.\d+\.\d+\b/.test(composeProbe.output)
+    !/\bDocker Compose version v?(?:[2-9]|[1-9]\d+)\.\d+\.\d+\b/.test(composeProbe.output)
   ) {
     stderr.write(
       "`podman compose` has no working provider. SpaceApp drives Compose through " +
-      `${PODMAN_COMPOSE_PROVIDER}; install Docker Compose v2 (the standalone docker-compose binary or the ` +
+      `${PODMAN_COMPOSE_PROVIDER}; install Docker Compose v2 or later (the standalone docker-compose binary or the ` +
       "Docker CLI compose plugin), then confirm `podman compose version` succeeds. " +
       "podman-compose (the Python tool) is not a supported provider.\n"
     );
